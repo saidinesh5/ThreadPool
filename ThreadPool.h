@@ -1,98 +1,192 @@
 #ifndef THREAD_POOL_H
 #define THREAD_POOL_H
 
-#include <vector>
-#include <queue>
-#include <memory>
-#include <thread>
-#include <mutex>
 #include <condition_variable>
-#include <future>
 #include <functional>
+#include <future>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <queue>
 #include <stdexcept>
+#include <thread>
+#include <tuple>
+#include <vector>
 
-class ThreadPool {
-public:
-    ThreadPool(size_t);
-    template<class F, class... Args>
-    auto enqueue(F&& f, Args&&... args) 
-        -> std::future<typename std::result_of<F(Args...)>::type>;
-    ~ThreadPool();
-private:
+class ThreadPool
+{
+    bool mStop;
     // need to keep track of threads so we can join them
-    std::vector< std::thread > workers;
-    // the task queue
-    std::queue< std::function<void()> > tasks;
-    
+    std::vector<std::thread> mWorkers;
+
+    using prioritized_task = std::tuple<int, std::function<void()>>;
+    std::priority_queue<prioritized_task,
+                        std::vector<prioritized_task>,
+                        std::function<bool(const prioritized_task&, const prioritized_task&)>> mTasks;
+
     // synchronization
-    std::mutex queue_mutex;
-    std::condition_variable condition;
-    bool stop;
-};
- 
-// the constructor just launches some amount of workers
-inline ThreadPool::ThreadPool(size_t threads)
-    :   stop(false)
-{
-    for(size_t i = 0;i<threads;++i)
-        workers.emplace_back(
-            [this]
+    std::mutex mQueueMutex;
+    std::mutex mTaskFinishedMutex;
+    std::condition_variable mQueueUpdatedCondition;
+    std::condition_variable mTaskFinishedCondition;
+
+public:
+
+    enum Priority
+    {
+        LowPriority = std::numeric_limits<int16_t>::min(),
+        NormalPriority = 0,
+        HighPriority = std::numeric_limits<int16_t>::max()
+    };
+
+    /**
+     * @brief ThreadPool constructor - by default sets the concurrency to the number of processor threads
+     * @param threads
+     */
+    explicit ThreadPool(size_t threads = std::thread::hardware_concurrency()):
+        mStop{false},
+        mWorkers{},
+        mTasks{[](prioritized_task const &l, prioritized_task const &r) { return std::get<0>(l) < std::get<0>(r); }},
+        mQueueMutex{},
+        mTaskFinishedMutex{},
+        mQueueUpdatedCondition{},
+        mTaskFinishedCondition{}
+    {
+        for(size_t i = 0; i < threads; i++)
+        {
+            mWorkers.emplace_back([this]()
+                                  {
+                                      for(;;)
+                                      {
+                                          std::function<void()> task;
+
+                                          {
+                                              std::unique_lock<std::mutex> lock(this->mQueueMutex);
+                                              this->mQueueUpdatedCondition.wait(lock,
+                                                                                [this](){ return this->mStop || !this->mTasks.empty();});
+
+                                              //End the worker thread immediately if it is asked to stop
+                                              if(this->mStop)
+                                              {
+                                                  return;
+                                              }
+                                              else
+                                              {
+                                                  task = std::get<1>(std::move(this->mTasks.top()));
+                                                  this->mTasks.pop();
+                                              }
+                                          }
+
+                                          task();
+                                          mTaskFinishedCondition.notify_all();
+                                      }
+                                  });
+        }
+    }
+
+    /**
+     * @brief ThreadPool destructor - tries to stop and wait for all the threads before quitting
+     */
+    ~ThreadPool()
+    {
+        {
+            std::unique_lock<std::mutex> lock(mQueueMutex);
+            mStop = true;
+        }
+
+        mQueueUpdatedCondition.notify_all();
+        for(std::thread &worker: mWorkers)
+        {
+            worker.join();
+        }
+    }
+
+    /**
+     * @brief enqueue a task onto the threadpool
+     * @param priority priority of the task to be enqueued. You can use LowPriority, NormalPriority, HighPriority for this.
+     * @param f - function to be enqueued to the threadpool
+     * @param args - args to the function that is enqueued
+     * eg. std::future<int> result = ThreadPool::instance()->enqueue(ThreadPool::NormalPriority,
+     *                                                               [](){ std::this_thread::sleep_for(std::chrono::seconds(i)); return 5*5;  });
+     */
+    template<class F, class... Args>
+    std::future<typename std::result_of<F(Args...)>::type> enqueue(int priority,
+                                                                   F&& f,
+                                                                   Args&&... args)
+    {
+        using return_type = typename std::result_of<F(Args...)>::type;
+        auto task = std::make_shared<std::packaged_task<return_type()>>(std::bind(std::forward<F>(f),
+                                                                                  std::forward<Args>(args)...));
+
+        std::future<return_type> res = task->get_future();
+
+        {
+            std::unique_lock<std::mutex> lock(mQueueMutex);
+
+            // don't allow enqueueing after stopping the pool
+            if(mStop)
             {
-                for(;;)
-                {
-                    std::function<void()> task;
-
-                    {
-                        std::unique_lock<std::mutex> lock(this->queue_mutex);
-                        this->condition.wait(lock,
-                            [this]{ return this->stop || !this->tasks.empty(); });
-                        if(this->stop && this->tasks.empty())
-                            return;
-                        task = std::move(this->tasks.front());
-                        this->tasks.pop();
-                    }
-
-                    task();
-                }
+                throw std::runtime_error("enqueue on stopped ThreadPool");
             }
-        );
-}
 
-// add new work item to the pool
-template<class F, class... Args>
-auto ThreadPool::enqueue(F&& f, Args&&... args) 
-    -> std::future<typename std::result_of<F(Args...)>::type>
-{
-    using return_type = typename std::result_of<F(Args...)>::type;
+            mTasks.emplace(prioritized_task(priority,
+                                            [task](){ (*task)(); }));
+        }
 
-    auto task = std::make_shared< std::packaged_task<return_type()> >(
-            std::bind(std::forward<F>(f), std::forward<Args>(args)...)
-        );
-        
-    std::future<return_type> res = task->get_future();
-    {
-        std::unique_lock<std::mutex> lock(queue_mutex);
-
-        // don't allow enqueueing after stopping the pool
-        if(stop)
-            throw std::runtime_error("enqueue on stopped ThreadPool");
-
-        tasks.emplace([task](){ (*task)(); });
+        mQueueUpdatedCondition.notify_one();
+        return res;
     }
-    condition.notify_one();
-    return res;
-}
 
-// the destructor joins all threads
-inline ThreadPool::~ThreadPool()
-{
+    /**
+     * @brief enqueue a task onto the threadpool with Normal Priority
+     * @param f - function to be enqueued to the threadpool
+     * @param args - args to the function that is enqueued
+     * eg. std::future<int> result = ThreadPool::instance()->enqueue([](){ std::this_thread::sleep_for(std::chrono::seconds(i)); return 5*5;  });
+     */
+    template<class F, class... Args>
+    std::future<typename std::result_of<F(Args...)>::type> enqueue(F&& f,
+                                                                   Args&&... args)
     {
-        std::unique_lock<std::mutex> lock(queue_mutex);
-        stop = true;
+        return enqueue(static_cast<int>(NormalPriority),
+                       f,
+                       args...);
     }
-    condition.notify_all();
-    for(std::thread &worker: workers)
-        worker.join();
-}
+
+    /**
+     * @brief wait - wait until all the tasks have been processed
+     */
+    void wait()
+    {
+        for(const auto &worker: mWorkers)
+        {
+            if (std::this_thread::get_id() == worker.get_id())
+            {
+                throw std::runtime_error("Cannot wait on threadpool from within a task");
+            }
+        }
+
+        while(!mTasks.empty())
+        {
+            std::unique_lock<std::mutex> lock(this->mTaskFinishedMutex);
+            this->mTaskFinishedCondition.wait(lock,
+                                              [this]() { return this->mTasks.empty(); });
+        }
+    }
+
+    size_t pendingTasks() const
+    {
+        return mTasks.size();
+    }
+
+    /**
+     * @brief instance of the Singleton Threadpool, For Application-wide usage
+     * @return
+     */
+    static ThreadPool* instance()
+    {
+        static ThreadPool p;
+        return &p;
+    }
+};
 
 #endif
