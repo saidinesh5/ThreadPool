@@ -12,10 +12,11 @@
 #include <thread>
 #include <tuple>
 #include <vector>
+#include <atomic>
 
 class ThreadPool
 {
-    bool mStop;
+    std::atomic_bool mStop;
     // need to keep track of threads so we can join them
     std::vector<std::thread> mWorkers;
 
@@ -63,10 +64,10 @@ public:
                                           {
                                               std::unique_lock<std::mutex> lock(this->mQueueMutex);
                                               this->mQueueUpdatedCondition.wait(lock,
-                                                                                [this](){ return this->mStop || !this->mTasks.empty();});
+                                                                                [this](){ return this->mStop.load() || !this->mTasks.empty();});
 
                                               //End the worker thread immediately if it is asked to stop
-                                              if(this->mStop)
+                                              if(this->mStop.load())
                                               {
                                                   return;
                                               }
@@ -91,7 +92,7 @@ public:
     {
         {
             std::unique_lock<std::mutex> lock(mQueueMutex);
-            mStop = true;
+            mStop.store(true);
         }
 
         mQueueUpdatedCondition.notify_all();
@@ -124,7 +125,7 @@ public:
             std::unique_lock<std::mutex> lock(mQueueMutex);
 
             // don't allow enqueueing after stopping the pool
-            if(mStop)
+            if(mStop.load())
             {
                 throw std::runtime_error("enqueue on stopped ThreadPool");
             }
